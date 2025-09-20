@@ -1,19 +1,3 @@
-"""
-app.py — EchoVerse
-Generative Audiobook Creator with Streamlit (local) and Gradio (Colab-friendly).
-
-Features:
-- Tone-adaptive rewriting (Neutral / Suspenseful / Inspiring)
-- Side-by-side text comparison
-- High-quality TTS using IBM Watson Text-to-Speech (MP3 output)
-- Streamlit UI (desktop) or Gradio UI (Colab/Jupyter-friendly)
-
-Run:
-- Local Streamlit:  streamlit run app.py
-- Local Gradio:     python app.py --gradio
-- Google Colab:     python app.py   (auto-detects Jupyter → launches Gradio)
-"""
-st
 import os
 import sys
 import argparse
@@ -21,26 +5,32 @@ import requests
 import tempfile
 from dataclasses import dataclass
 from typing import List
+from concurrent.futures import ThreadPoolExecutor
 
 # UI libs
 import streamlit as st
 import gradio as gr
 
-# Optional transformers pipeline
-try:
-    from transformers import pipeline
-    HAS_TRANSFORMERS = True
-except Exception:
-    HAS_TRANSFORMERS = False
+# Transformers
+from transformers import pipeline
 
 # ---------------------------
 # Config
 # ---------------------------
 DEFAULT_GRANITE_MODEL = "ibm-granite/granite-3.3-2b-instruct"
+
 IBM_VOICES = {
     "Lisa (Female, warm/clear)": "en-US_LisaV3Voice",
     "Michael (Male, professional)": "en-US_MichaelV3Voice",
     "Allison (Neutral, conversational)": "en-US_AllisonV3Voice",
+    "Madhur (Hindi, male)": "hi-IN_MadhurV3Voice",
+    "Venba (Tamil, female)": "ta-IN_VenbaV3Voice",
+}
+
+LANGUAGE_MAP = {
+    "English": "en",
+    "Hindi": "hi",
+    "Tamil": "ta"
 }
 
 # ---------------------------
@@ -70,15 +60,39 @@ def heuristic_rewrite(text: str, tone: str) -> str:
         return text + "\n\nAnd remember: greatness awaits!"
 
 # ---------------------------
+# Cached Transformers
+# ---------------------------
+_translation_pipes = {}
+
+def get_translation_pipe(target_lang: str):
+    if target_lang == "English":
+        return None
+    if target_lang not in _translation_pipes:
+        lang_code = LANGUAGE_MAP.get(target_lang)
+        model_name = f"Helsinki-NLP/opus-mt-en-{lang_code}"
+        _translation_pipes[target_lang] = pipeline("translation", model=model_name)
+    return _translation_pipes[target_lang]
+
+def translate_text(text: str, target_lang: str) -> str:
+    if target_lang == "English":
+        return text
+    try:
+        trans_pipe = get_translation_pipe(target_lang)
+        return trans_pipe(text)[0]['translation_text']
+    except Exception as e:
+        print(f"[⚠️ Translation Error] {e}")
+        return text
+
+# ---------------------------
 # Rewriter
 # ---------------------------
 class GraniteRewriter:
-    def __init__(self, model_name=DEFAULT_GRANITE_MODEL):
+    def _init_(self, model_name=DEFAULT_GRANITE_MODEL):
         self.model_name = model_name
         self._pipe = None
 
     def _init(self):
-        if self._pipe or not HAS_TRANSFORMERS:
+        if self._pipe:
             return
         try:
             self._pipe = pipeline("text-generation", model=self.model_name)
@@ -92,7 +106,7 @@ class GraniteRewriter:
             return heuristic_rewrite(text, tone)
         try:
             prompt = f"Rewrite the following text in a {tone} tone, keeping meaning intact:\n\n{text}\n\nRewritten:"
-            out = self._pipe(prompt, max_new_tokens=500, do_sample=False)[0]["generated_text"]
+            out = self._pipe(prompt, max_new_tokens=300, do_sample=False)[0]["generated_text"]
             return out.split("Rewritten:")[-1].strip()
         except Exception:
             return heuristic_rewrite(text, tone)
@@ -120,13 +134,26 @@ class EchoVerseResult:
     audio_bytes: bytes
     audio_filename: str = "echoverse_output.mp3"
 
-def generate_audiobook(original_text: str, tone: str, voice: str, rewriter: GraniteRewriter, api_key: str, url: str) -> EchoVerseResult:
+def generate_audiobook(original_text: str, tone: str, voice: str, rewriter: GraniteRewriter, api_key: str, url: str, target_lang: str = "English") -> EchoVerseResult:
     chunks = smart_chunk_text(original_text, max_chars=2000)
-    rewritten_chunks = [rewriter.rewrite_chunk(c, tone) for c in chunks]
+
+    # Parallel rewriting
+    with ThreadPoolExecutor() as executor:
+        rewritten_chunks = list(executor.map(lambda c: rewriter.rewrite_chunk(c, tone), chunks))
+
     rewritten = "\n\n".join(rewritten_chunks)
+
+    # Translate once
+    if target_lang != "English":
+        rewritten = translate_text(rewritten, target_lang)
+
+    # Parallel TTS
     voice_id = IBM_VOICES[voice]
-    audio = b"".join([synthesize_ibm_tts(c, voice_id, api_key, url) for c in smart_chunk_text(rewritten, 2000)])
-    return EchoVerseResult(rewritten_text=rewritten, audio_bytes=audio)
+    tts_chunks = smart_chunk_text(rewritten, 2000)
+    with ThreadPoolExecutor() as executor:
+        audio_parts = list(executor.map(lambda c: synthesize_ibm_tts(c, voice_id, api_key, url), tts_chunks))
+
+    return EchoVerseResult(rewritten_text=rewritten, audio_bytes=b"".join(audio_parts))
 
 # ---------------------------
 # Streamlit UI
@@ -146,6 +173,7 @@ def streamlit_app():
 
         tone = st.selectbox("Tone", ["Neutral", "Suspenseful", "Inspiring"])
         voice = st.selectbox("Voice", list(IBM_VOICES.keys()))
+        target_lang = st.selectbox("Target Language", ["English", "Hindi", "Tamil"])
 
         api_key = os.environ.get("IBM_TTS_APIKEY", "")
         url = os.environ.get("IBM_TTS_URL", "")
@@ -153,7 +181,7 @@ def streamlit_app():
         if st.button("Generate 🎧"):
             try:
                 rewriter = GraniteRewriter()
-                result = generate_audiobook(text, tone, voice, rewriter, api_key, url)
+                result = generate_audiobook(text, tone, voice, rewriter, api_key, url, target_lang)
                 st.session_state["result"] = result
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -161,9 +189,7 @@ def streamlit_app():
     with col2:
         if "result" in st.session_state:
             r: EchoVerseResult = st.session_state["result"]
-            st.subheader("Original")
-            st.text_area("Original", value=text, height=200)
-            st.subheader("Rewritten")
+            st.subheader("Rewritten Text")
             st.text_area("Rewritten", value=r.rewritten_text, height=200)
             st.audio(r.audio_bytes, format="audio/mp3")
             st.download_button("Download MP3", data=r.audio_bytes, file_name=r.audio_filename, mime="audio/mpeg")
@@ -172,12 +198,11 @@ def streamlit_app():
 # Gradio UI
 # ---------------------------
 def gradio_app():
-    def run(text, tone, voice, api_key, url):
+    def run(text, tone, voice, api_key, url, target_lang):
         try:
             rewriter = GraniteRewriter()
-            r = generate_audiobook(text, tone, voice, rewriter, api_key, url)
+            r = generate_audiobook(text, tone, voice, rewriter, api_key, url, target_lang)
 
-            # Save to temp file for playback
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             tmp.write(r.audio_bytes)
             tmp.flush()
@@ -191,22 +216,21 @@ def gradio_app():
         text = gr.Textbox(label="Input text", lines=10)
         tone = gr.Radio(["Neutral", "Suspenseful", "Inspiring"], value="Neutral")
         voice = gr.Dropdown(list(IBM_VOICES.keys()), value=list(IBM_VOICES.keys())[0])
+        lang = gr.Dropdown(["English", "Hindi", "Tamil"], label="Target Language", value="English")
         api_key = gr.Textbox(label="IBM TTS API Key", value=os.environ.get("IBM_TTS_APIKEY", ""))
         url = gr.Textbox(label="IBM TTS URL", value=os.environ.get("IBM_TTS_URL", ""))
         btn = gr.Button("Generate 🎧")
 
-        # ✅ fixed: type="filepath" for playback
         audio = gr.Audio(label="Audio", type="filepath")
         rewritten = gr.Textbox(label="Rewritten text", lines=10)
 
-        btn.click(run, [text, tone, voice, api_key, url], [audio, rewritten])
+        btn.click(run, [text, tone, voice, api_key, url, lang], [audio, rewritten])
     demo.launch()
 
 # ---------------------------
 # Entrypoint
 # ---------------------------
 def main():
-    # Detect if running in Jupyter/Colab
     if "google.colab" in sys.modules or "ipykernel" in sys.modules:
         print("📌 Detected Colab/Jupyter — launching Gradio UI")
         gradio_app()
@@ -222,6 +246,8 @@ def main():
     else:
         print("👉 Run with: streamlit run app.py (for Streamlit UI)")
         print("👉 Or: python app.py --gradio (for Gradio UI)")
+        streamlit_app()
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
+
